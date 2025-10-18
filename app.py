@@ -1,9 +1,8 @@
+
 # primary_gpt_teacher_app_streamlit.py
 import os
 import time
-import numpy as np
 import streamlit as st
-
 from rank_bm25 import BM25Okapi
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -15,7 +14,8 @@ from langchain_core.output_parsers import StrOutputParser
 # Config / Keys
 # ----------------------------
 GROQ_API_KEY = os.getenv("groq_api_key") or os.getenv("GROQ_API_KEY")
-DB_FAISS_PATH = "db_faiss"
+BASE_DIR = os.path.dirname(__file__)
+DB_FAISS_PATH = os.path.join(BASE_DIR, "db_faiss")
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # ----------------------------
@@ -41,24 +41,44 @@ PROMPT = ChatPromptTemplate.from_messages([
 # ----------------------------
 class ChatBot:
     def __init__(self):
-        self.embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL, model_kwargs={"device": "cpu"})
-        self.db = None
+        # Initialize embeddings
         try:
-            self.db = FAISS.load_local(DB_FAISS_PATH, self.embeddings, allow_dangerous_deserialization=True)
-        except:
-            print("[WARN] No FAISS DB found; retrieval will be limited.")
+            self.embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL, model_kwargs={"device": "cpu"})
+        except Exception as e:
+            print(f"[ERROR] Failed to load embeddings: {e}")
+            self.embeddings = None
 
-        self.llm = ChatGroq(
-            groq_api_key=GROQ_API_KEY,
-            model_name="llama-3.1-8b-instant",
-            streaming=False,
-            temperature=0.2,
-        )
+        # Load FAISS DB
+        self.db = None
+        if self.embeddings and os.path.exists(DB_FAISS_PATH):
+            try:
+                self.db = FAISS.load_local(DB_FAISS_PATH, self.embeddings, allow_dangerous_deserialization=True)
+            except Exception as e:
+                print(f"[WARN] Failed to load FAISS DB: {e}. Retrieval will be limited.")
+        else:
+            print("[WARN] FAISS DB folder not found; retrieval will be limited.")
 
+        # Initialize LLM
+        try:
+            self.llm = ChatGroq(
+                groq_api_key=GROQ_API_KEY,
+                model_name="llama-3.1-8b-instant",
+                streaming=False,
+                temperature=0.2,
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize LLM: {e}")
+            self.llm = None
+
+        # BM25 setup
         self.doc_texts, self.bm25 = [], None
         self._build_bm25_index()
 
-        self.chain = PROMPT | self.llm | StrOutputParser()
+        # Build chain if possible
+        if self.llm:
+            self.chain = PROMPT | self.llm | StrOutputParser()
+        else:
+            self.chain = None
 
     def _build_bm25_index(self):
         if self.db:
@@ -67,8 +87,8 @@ class ChatBot:
                 self.doc_texts = [d.page_content for d in all_docs]
                 if self.doc_texts:
                     self.bm25 = BM25Okapi([t.split() for t in self.doc_texts])
-            except:
-                pass
+            except Exception as e:
+                print(f"[WARN] BM25 index failed: {e}")
 
     def hybrid_retrieve_and_rerank(self, query, top_k=5):
         if not self.db or not self.doc_texts:
@@ -83,10 +103,12 @@ class ChatBot:
         last_turns = history[-4:] if history else []
         formatted_history = "\n".join([f"User: {u}\nAssistant: {a}" for u, a in last_turns])
         context = self.hybrid_retrieve_and_rerank(query)
-        try:
-            return self.chain.invoke({"context": context, "question": query}).strip()
-        except Exception as e:
-            return f"Error generating response: {e}"
+        if self.chain:
+            try:
+                return self.chain.invoke({"context": context, "question": query}).strip()
+            except Exception as e:
+                return f"Error generating response: {e}"
+        return "LLM not initialized; cannot generate answer."
 
 # ----------------------------
 # Streamlit App
